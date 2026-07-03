@@ -123,18 +123,13 @@ function log(msg){
 let sdk, wallet, account, myAddress;
 
 async function loadSdk(){
-  log('Loading @tetherto/wdk + wdk-wallet-evm from esm.sh...');
-  let core = await import('https://esm.sh/@tetherto/wdk@latest?bundle');
-  if (!core.default && core.WDK) core = { default: core.WDK };
-  if (!core.default && !core.WDK) {
-    // some builds expose the class as the module's default differently
-  }
+  log('Loading ethers (for seed phrase generation) + @tetherto/wdk-wallet-evm from esm.sh...');
+  const ethers = await import('https://esm.sh/ethers@6?bundle');
   let evmMod = await import('https://esm.sh/@tetherto/wdk-wallet-evm@latest?bundle');
   let WalletManagerEvm = evmMod.default || evmMod.WalletManagerEvm;
   if (!WalletManagerEvm) throw new Error('Could not resolve WalletManagerEvm export. Got keys: ' + Object.keys(evmMod).join(', '));
-  const WDKCore = core.default || core.WDK;
-  log('SDK modules loaded. WDK core keys: ' + Object.keys(core).join(', ') + ' | evm keys: ' + Object.keys(evmMod).join(', '));
-  return { WDKCore, WalletManagerEvm };
+  log('SDK modules loaded. evm keys: ' + Object.keys(evmMod).join(', '));
+  return { ethers, WalletManagerEvm };
 }
 
 function padHex(hex, bytes){ return hex.replace('0x','').padStart(bytes*2,'0'); }
@@ -154,14 +149,10 @@ function fromTokenUnits(big){
 document.getElementById('btn-create-wallet').addEventListener('click', async () => {
   const pill = document.getElementById('wallet-pill');
   try{
-    const { WDKCore, WalletManagerEvm } = await loadSdk();
-    let seedPhrase;
-    if (WDKCore && typeof WDKCore.getRandomSeedPhrase === 'function') {
-      seedPhrase = WDKCore.getRandomSeedPhrase();
-    } else {
-      throw new Error('Could not find getRandomSeedPhrase on WDK core export. Click again or check console.');
-    }
-    log('Generated a fresh local seed phrase.');
+    const { ethers, WalletManagerEvm } = await loadSdk();
+    const randomWallet = ethers.Wallet.createRandom();
+    const seedPhrase = randomWallet.mnemonic.phrase;
+    log('Generated a fresh local seed phrase via ethers.js.');
     wallet = new WalletManagerEvm(seedPhrase, { provider: RPC });
     account = await wallet.getAccount(0);
     myAddress = await account.getAddress();
