@@ -90,17 +90,21 @@
   <!-- PAY -->
   <div class="card">
     <h2>3 · Everyone Else: Pay Your Share</h2>
-    <label>Organizer's Address (paste from the tab summary above)</label>
-    <input id="pay-to" placeholder="0x...">
+    <label>Tab ID (paste from the tab summary above)</label>
+    <input id="pay-tabid" type="number" placeholder="0">
     <label>Amount You Owe (USDT)</label>
     <input id="pay-amount" type="number" placeholder="10.00" step="0.01">
-    <button id="btn-pay">Sign &amp; Pay My Share</button>
-    <div class="note">This builds and signs a real ERC-20 transfer in your browser using your own wallet — nothing goes through a server we control.</div>
+    <button id="btn-pay">Approve &amp; Pay Into Escrow</button>
+    <div class="note">This does two real on-chain steps in your browser: (1) approve the SplitEscrow contract to spend your USDT, (2) call payShare to lock it in escrow. Once everyone has paid, the contract auto-releases the full amount to the organizer — nothing goes through a server we control.</div>
   </div>
 
   <div class="card">
     <h2>Log</h2>
     <div class="log" id="log">Waiting...</div>
+  </div>
+
+  <div class="note" style="text-align:center;margin-top:10px">
+    SplitEscrow contract on Sepolia: <a href="https://sepolia.etherscan.io/address/0x22cC34d2B88f5dD77F7310d3f1433a2801432a10" target="_blank">0x22cC34d2...432a10</a>
   </div>
 </div>
 
@@ -111,6 +115,16 @@ const DECIMALS = 6;
 const SEL_TRANSFER = '0xa9059cbb';
 const SEL_FAUCET = '0xf5e3f1f7'; // _giveMeATokens(uint256)
 const EXPLORER = 'https://sepolia.etherscan.io';
+
+// SplitEscrow — deployed on Sepolia, holds each person's share until the tab
+// is fully collected, then auto-releases to the organizer in one transaction.
+const SPLIT_ESCROW = '0x22cC34d2B88f5dD77F7310d3f1433a2801432a10';
+const SEL_CREATE_TAB = '0xb263d5c4';   // createTab(address,uint256,uint256)
+const SEL_PAY_SHARE  = '0x2330de29';   // payShare(uint256,uint256)
+const SEL_APPROVE    = '0x095ea7b3';   // approve(address,uint256)
+const SEL_REMAINING  = '0x0361bf14';   // remaining(uint256)
+const TOPIC_TAB_CREATED = '0x27d91e477889d9255ac05d21b55fdffdebccae09341a3555e163d29c8800c32c';
+const TAB_DEADLINE_SECONDS = 7 * 24 * 60 * 60; // 7 days to collect before refunds unlock
 
 const logEl = document.getElementById('log');
 function log(msg){
@@ -144,6 +158,31 @@ function fromTokenUnits(big){
   const i = s.slice(0, s.length-DECIMALS) || '0';
   const f = s.slice(s.length-DECIMALS);
   return i + '.' + f;
+}
+
+async function rpcCall(method, params){
+  const resp = await fetch(RPC, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ jsonrpc:'2.0', id:1, method, params })
+  });
+  const j = await resp.json();
+  if (j.error) throw new Error('RPC error: ' + JSON.stringify(j.error));
+  return j.result;
+}
+
+async function waitForReceipt(txHash, label){
+  log(`Waiting for ${label || 'transaction'} to confirm...`);
+  for (let i = 0; i < 20; i++){
+    const receipt = await rpcCall('eth_getTransactionReceipt', [txHash]);
+    if (receipt) {
+      if (receipt.status === '0x0') throw new Error((label||'Transaction') + ' reverted on-chain.');
+      log(`✅ ${label || 'Transaction'} confirmed in block ${parseInt(receipt.blockNumber,16)}.`);
+      return receipt;
+    }
+    await new Promise(r => setTimeout(r, 3000));
+  }
+  throw new Error('Timed out waiting for confirmation — check the explorer link manually.');
 }
 
 document.getElementById('btn-create-wallet').addEventListener('click', async () => {
@@ -203,44 +242,81 @@ document.getElementById('btn-faucet').addEventListener('click', async () => {
   }
 });
 
-document.getElementById('btn-create-tab').addEventListener('click', () => {
+document.getElementById('btn-create-tab').addEventListener('click', async () => {
+  const btn = document.getElementById('btn-create-tab');
+  if (!account) { log('❌ Generate your wallet first (step 1).'); return; }
   const total = parseFloat(document.getElementById('tab-total').value || '0');
   const people = parseInt(document.getElementById('tab-people').value || '1');
   const share = (total / people).toFixed(2);
-  const addr = myAddress || '(generate your wallet above first)';
   const box = document.getElementById('tab-summary');
-  box.style.display = 'block';
-  box.innerHTML = `<div class="split-summary">
-    <strong>Tab created!</strong><br>
-    Total: ${total.toFixed(2)} USDT across ${people} people<br>
-    Each person owes: <strong>${share} USDT</strong><br>
-    Pay to: <span style="color:var(--green)">${addr}</span><br><br>
-    Share this with your group:<br>
-    <em>"Send ${share} USDT to ${addr} for the match tab — use MatchTab, connect your own wallet, no app needed."</em>
-  </div>
-  <button class="secondary copy-btn" id="btn-copy-summary">Copy Message</button>`;
-  document.getElementById('btn-copy-summary').addEventListener('click', () => {
-    navigator.clipboard.writeText(`Send ${share} USDT to ${addr} for the match tab — use MatchTab, connect your own wallet, no app needed.`);
-    log('Copied tab summary to clipboard.');
-  });
+
+  btn.disabled = true;
+  try{
+    const totalUnits = toTokenUnits(total.toString());
+    const deadlineHex = TAB_DEADLINE_SECONDS.toString(16);
+    const data = SEL_CREATE_TAB + padHex(USDT, 32) + padHex(totalUnits.toString(16), 32) + padHex(deadlineHex, 32);
+
+    log(`Creating on-chain tab: ${total.toFixed(2)} USDT total, ${people} people...`);
+    const result = await account.sendTransaction({ to: SPLIT_ESCROW, value: 0n, data });
+    log('Tab creation tx sent: ' + result.hash);
+    const receipt = await waitForReceipt(result.hash, 'Tab creation');
+
+    const createdLog = receipt.logs.find(l => l.topics[0] === TOPIC_TAB_CREATED);
+    if (!createdLog) throw new Error('Transaction confirmed but no TabCreated event found — check the receipt on Etherscan.');
+    const tabId = parseInt(createdLog.topics[1], 16);
+
+    log(`🎉 Tab #${tabId} created on-chain, funds will be held in escrow until fully collected.`);
+
+    box.style.display = 'block';
+    box.innerHTML = `<div class="split-summary">
+      <strong>On-chain Tab #${tabId} created!</strong><br>
+      Total: ${total.toFixed(2)} USDT across ${people} people<br>
+      Each person owes: <strong>${share} USDT</strong><br>
+      Funds are held by the SplitEscrow contract — released to the organizer automatically once everyone has paid.<br>
+      Tx: <a href="${EXPLORER}/tx/${result.hash}" target="_blank">${result.hash.slice(0,10)}...</a><br><br>
+      Share this with your group:<br>
+      <em>"Join MatchTab Tab #${tabId} — pay your ${share} USDT share at ${location.href.split('?')[0]}. Self-custodial, no app needed."</em>
+    </div>
+    <button class="secondary copy-btn" id="btn-copy-summary">Copy Message</button>`;
+    document.getElementById('btn-copy-summary').addEventListener('click', () => {
+      navigator.clipboard.writeText(`Join MatchTab Tab #${tabId} — pay your ${share} USDT share at ${location.href.split('?')[0]}. Self-custodial, no app needed.`);
+      log('Copied tab summary to clipboard.');
+    });
+    document.getElementById('pay-tabid').value = tabId;
+    document.getElementById('pay-amount').value = share;
+  }catch(e){
+    log('❌ Create tab error: ' + (e?.message || e));
+  }finally{
+    btn.disabled = false;
+  }
 });
 
 document.getElementById('btn-pay').addEventListener('click', async () => {
   const btn = document.getElementById('btn-pay');
   if (!account) { log('❌ Generate your wallet first (step 1).'); return; }
-  const to = document.getElementById('pay-to').value.trim();
+  const tabId = document.getElementById('pay-tabid').value.trim();
   const amountStr = document.getElementById('pay-amount').value.trim();
-  if (!to.match(/^0x[0-9a-fA-F]{40}$/)) { log('❌ Invalid organizer address.'); return; }
+  if (tabId === '' || isNaN(parseInt(tabId))) { log('❌ Enter a valid tab ID.'); return; }
   if (!amountStr || parseFloat(amountStr) <= 0) { log('❌ Enter a valid amount.'); return; }
 
   btn.disabled = true;
   try{
     const units = toTokenUnits(amountStr);
-    const data = SEL_TRANSFER + padHex(to, 32) + padHex(units.toString(16), 32);
-    log(`Building transfer: ${amountStr} USDT to ${to} ...`);
-    const result = await account.sendTransaction({ to: USDT, value: 0n, data });
-    log('🎉 Payment sent! Tx hash: ' + result.hash);
-    log('View: ' + EXPLORER + '/tx/' + result.hash);
+    const tabIdHex = parseInt(tabId).toString(16);
+
+    log(`Step 1/2: approving SplitEscrow to spend ${amountStr} USDT...`);
+    const approveData = SEL_APPROVE + padHex(SPLIT_ESCROW, 32) + padHex(units.toString(16), 32);
+    const approveResult = await account.sendTransaction({ to: USDT, value: 0n, data: approveData });
+    log('Approve tx sent: ' + approveResult.hash);
+    await waitForReceipt(approveResult.hash, 'Approval');
+
+    log(`Step 2/2: paying your share into escrow for Tab #${tabId}...`);
+    const payData = SEL_PAY_SHARE + padHex(tabIdHex, 32) + padHex(units.toString(16), 32);
+    const payResult = await account.sendTransaction({ to: SPLIT_ESCROW, value: 0n, data: payData });
+    log('Payment tx sent: ' + payResult.hash);
+    await waitForReceipt(payResult.hash, 'Escrow payment');
+
+    log('🎉 Your share is locked in escrow. View: ' + EXPLORER + '/tx/' + payResult.hash);
     setTimeout(refreshBalances, 4000);
   }catch(e){
     log('❌ Payment error: ' + (e?.message || e));
